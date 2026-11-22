@@ -1,0 +1,174 @@
+---
+- name: Настройка OpenVPN-сервера ( туннель, PKI, сервис)
+  hosts: vagrant_boxes
+  become: true
+
+  vars:
+    easyrsa_cmd: /usr/share/easy-rsa/easyrsa
+    pki_dir: /etc/openvpn/pki
+    etc_openvpn: /etc/openvpn
+    shared_dir: /vagrant/vpn_lab        # синхронизированная папка Vagrant
+
+  tasks:
+    # ---------- Пакеты и базовая подготовка ----------
+    - name: Обновить кэш apt
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Установить пакеты
+      ansible.builtin.apt:
+        name:
+          - openvpn
+          - easy-rsa
+          - iperf3
+          - selinux-utils
+          - traceroute
+        state: present
+
+    - name: Перевести SELinux в permissive (lab)
+      ansible.builtin.command: setenforce 0
+      changed_when: false
+      failed_when: false        # если SELinux отсутствует — не падать
+
+    - name: SELinux permissive после перезагрузки
+      ansible.posix.selinux:
+        policy: targeted
+        state: permissive
+      failed_when: false
+
+    # ---------- PKI (каждый шаг идемпотентен через creates) ----------
+    - name: Инициализация PKI
+      ansible.builtin.command:
+        cmd: "{{ easyrsa_cmd }} init-pki"
+        chdir: "{{ etc_openvpn }}"
+      args:
+        creates: "{{ pki_dir }}"
+
+    - name: Сборка корневого CA
+      ansible.builtin.shell: |
+        echo 'rasvpn' | {{ easyrsa_cmd }} build-ca nopass
+      args:
+        chdir: "{{ etc_openvpn }}"
+        creates: "{{ pki_dir }}/private/ca.key"
+
+    - name: Запрос на подпись для сервера
+      ansible.builtin.shell: |
+        echo 'rasvpn' | {{ easyrsa_cmd }} gen-req server nopass
+      args:
+        chdir: "{{ etc_openvpn }}"
+        creates: "{{ pki_dir }}/reqs/server.req"
+
+    - name: Подписание серверного сертификата CA
+      ansible.builtin.shell: |
+        echo 'yes' | {{ easyrsa_cmd }} sign-req server server
+      args:
+        chdir: "{{ etc_openvpn }}"
+        creates: "{{ pki_dir }}/issued/server.crt"
+
+    - name: Параметры Диффи-Хеллмана
+      ansible.builtin.command:
+        cmd: "{{ easyrsa_cmd }} gen-dh"
+        chdir: "{{ etc_openvpn }}"
+      args:
+        creates: "{{ pki_dir }}/dh.pem"
+
+    - name: Статический ключ OpenVPN (tls-auth/tls-crypt, не ключ CA!)
+      ansible.builtin.command:
+        cmd: openvpn --genkey secret /etc/openvpn/ca.key
+      args:
+        creates: "{{ etc_openvpn }}/ca.key"
+
+    - name: Запрос на подпись для клиента
+      ansible.builtin.shell: |
+        echo 'client' | {{ easyrsa_cmd }} gen-req client nopass
+      args:
+        chdir: "{{ etc_openvpn }}"
+        creates: "{{ pki_dir }}/reqs/client.req"
+
+    - name: Подписание клиентского сертификата CA
+      ansible.builtin.shell: |
+        echo 'yes' | {{ easyrsa_cmd }} sign-req client client
+      args:
+        chdir: "{{ etc_openvpn }}"
+        creates: "{{ pki_dir }}/issued/client.crt"
+
+    # ---------- Копирование в синхронизированную папку Vagrant ----------
+    - name: Создать каталог для ключей клиента
+      ansible.builtin.file:
+        path: "{{ shared_dir }}/client"
+        state: directory
+        mode: "0755"
+
+    - name: Раздать сертификаты и ключи в общую папку
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ shared_dir }}/client/{{ item.dest }}"
+        remote_src: true
+        mode: "0600"
+      loop:
+        - { src: "{{ pki_dir }}/ca.crt",                  dest: ca.crt }
+        - { src: "{{ pki_dir }}/issued/client.crt",       dest: client.crt }
+        - { src: "{{ pki_dir }}/private/client.key",      dest: client.key }
+
+    # ---------- Конфигурация сервера ----------
+    - name: server.conf (без ручного push — его делает макрос server)
+      ansible.builtin.copy:
+        dest: "{{ etc_openvpn }}/server.conf"
+        mode: "0644"
+        content: |
+          port 1207
+          proto udp
+          dev tun
+          ca {{ pki_dir }}/ca.crt
+          cert {{ pki_dir }}/issued/server.crt
+          key {{ pki_dir }}/private/server.key
+          dh {{ pki_dir }}/dh.pem
+          server 10.10.10.0 255.255.255.0
+          ifconfig-pool-persist ipp.txt
+          client-to-client
+          client-config-dir {{ etc_openvpn }}/client
+          status-version 3
+          keepalive 10 120
+          comp-lzo
+          persist-key
+          persist-tun
+          status /var/log/openvpn-status.log
+          log /var/log/openvpn.log
+          verb 3
+
+    # ---------- systemd-сервис ----------
+    - name: Юнит openvpn@.service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/openvpn@.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=OpenVPN Tunneling Application On %I
+          After=network.target
+
+          [Service]
+          Type=notify
+          PrivateTmp=true
+          ExecStart=/usr/sbin/openvpn --cd /etc/openvpn/ --config %i.conf
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Перезагрузить systemd
+
+    - name: Каталог для CCD
+      ansible.builtin.file:
+        path: "{{ etc_openvpn }}/client"
+        state: directory
+        mode: "0755"
+
+    - name: Запустить и включить openvpn@server
+      ansible.builtin.systemd:
+        name: openvpn@server
+        state: started
+        enabled: true
+
+  handlers:
+    - name: Перезагрузить systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
